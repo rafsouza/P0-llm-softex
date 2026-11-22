@@ -1,0 +1,12 @@
+venv/
+env/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+*.tar
+*.tar.gz
+logs/*.log
+data/*
+!data/.gitkeep
+!logs/.gitkeep
