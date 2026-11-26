@@ -1,168 +1,119 @@
-import os
-import json
 import logging
 import requests
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
-from dotenv import load_dotenv
 
-load_dotenv()
+from src.config import AppConfig
+from src.exceptions import (
+    CommunicationError,
+    InvalidCredentialError,
+    InvalidResponseError,
+    LLMTimeoutError,
+    ModelUnavailableError,
+)
+from src.request_builder import ModelRequestSpec
 
 urllib3.disable_warnings(InsecureRequestWarning)
 
-os.makedirs("logs", exist_ok=True)
-
-logging.basicConfig(
-    filename='logs/client.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
-class LLMConnectionError(RuntimeError):
-    """Falha de conexão com o servidor interno do LLM."""
-
-
-class LLMTimeoutError(RuntimeError):
-    """Tempo limite excedido aguardando resposta do LLM."""
-
-
-class LLMResponseError(RuntimeError):
-    """Erro HTTP do servidor ou resposta JSON inválida do LLM."""
-
-
 class LLMClient:
-    EXPECTED_FIELDS = ("titulo", "data_hora", "local", "descricao", "prioridade")
+    def __init__(self, config: AppConfig):
+        self.config = config
 
-    def __init__(self):
-        raw_url = os.getenv("LLM_URL")
-        if not raw_url or not raw_url.strip():
-            raise ValueError(
-                "A variável de ambiente 'LLM_URL' é obrigatória e não foi configurada."
-            )
+    def invoke(self, request_spec: ModelRequestSpec) -> dict:
+        """Chamada HTTP POST ao modelo LLM."""
+        logger.info(
+            "Chamando LLM | modelo=%s | url=%s | preview='%s'",
+            self.config.llm_model,
+            request_spec.url,
+            request_spec.sanitized_preview,
+        )
 
-        raw_model = os.getenv("LLM_MODEL")
-        if not raw_model or not raw_model.strip():
-            raise ValueError(
-                "A variável de ambiente 'LLM_MODEL' é obrigatória e não foi configurada."
-            )
-
-        self.base_url = raw_url.strip().rstrip("/")
-        self.model = raw_model.strip()
-        self.timeout = int(os.getenv("LLM_TIMEOUT", "45"))
-        
-
-    @staticmethod
-    def _sanitize_text(text: str, max_chars: int = 30) -> str:
-        """Truncamento e remoção de quebras de linha do texto (evitar vazamento de dados nos logs)."""
-        cleaned = " ".join(text.split())
-        return f"{cleaned[:max_chars]}..." if len(cleaned) > max_chars else cleaned
-    
-    def _normalize_event_data(self, raw_data: dict) -> dict:
-        """Garante que o retorno contenha exatamente as chaves esperadas e prioridade válida."""
-        if not isinstance(raw_data, dict):
-            raise LLMResponseError("O servidor LLM não retornou um objeto JSON válido.")
-
-        normalized = {
-            field: str(raw_data.get(field, "") or "").strip()
-            for field in self.EXPECTED_FIELDS
-        }
-
-        prioridade = normalized["prioridade"].lower()
-        if prioridade in {"alta", "média", "media", "baixa"}:
-            normalized["prioridade"] = "média" if prioridade == "media" else prioridade
-        else:
-            normalized["prioridade"] = "média"
-
-        return normalized
-
-    def check_health(self) -> dict:
-        """Verifica se o servidor Ollama interno está acessível (endpoint leve /api/tags)."""
-        url = f"{self.base_url}/api/tags"
-        try:
-            response = requests.get(url, timeout=5, verify=False)
-            response.raise_for_status()
-            return {"reachable": True, "status_code": response.status_code}
-        except requests.exceptions.RequestException as exc:
-            logger.warning(f"Falha no healthcheck do LLM ({url}): {exc}")
-            return {"reachable": False, "error": "Servidor LLM interno inacessível."}
-
-    def extract_event_data(self, text: str) -> dict:
-        """
-        Envia o texto ao LLM interno e retorna um dicionário estruturado.
-        """
-        url = f"{self.base_url}/api/generate"
-        
-        prompt = f"""
-        Você é um assistente de agendamento. Analise o texto abaixo e extraia informações de eventos.
-        Retorne APENAS um JSON válido e estrito com as seguintes chaves (se algo não for encontrado, deixe vazio):
-        "titulo": "Título curto gerado para o evento",
-        "data_hora": "Data e hora mencionadas ou relativas",
-        "local": "Local do evento",
-        "descricao": "Breve descrição do contexto",
-        "prioridade": "alta", "média" ou "baixa"
-        
-        Texto: {text}
-        """
-        
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json" 
-        }
-        
-        safe_preview = self._sanitize_text(text)
-        logger.info(f"Enviando requisição ao LLM | modelo={self.model} | preview='{safe_preview}'")
-        
         try:
             response = requests.post(
-                url,
-                json=payload,
-                timeout=self.timeout,
-                verify=False,
+                request_spec.url,
+                json=request_spec.payload,
+                headers=request_spec.headers,
+                timeout=request_spec.timeout,
+                verify=request_spec.verify_ssl,
             )
-            response.raise_for_status()
-            
-            logger.info(f"Resposta recebida do LLM. HTTP {response.status_code}")
-            
-            body = response.json()
-            raw_response = body.get("response")
-            if not raw_response:
-                logger.error("Campo 'response' ausente ou vazio no retorno do Ollama.")
-                raise LLMResponseError("O servidor LLM retornou uma resposta vazia.")
-
-            parsed = json.loads(raw_response)
-            return self._normalize_event_data(parsed)
-            
         except requests.exceptions.Timeout:
-            logger.error(f"Timeout atingido ({self.timeout}s) na comunicação com o LLM.")
+            logger.error("Timeout (%ss) aguardando resposta do LLM.", request_spec.timeout)
             raise LLMTimeoutError("O servidor LLM demorou muito para responder.")
-
         except requests.exceptions.ConnectionError:
-            logger.error(f"Erro de conexão ao acessar o servidor LLM em {self.base_url}.")
-            raise LLMConnectionError(
-                "Não foi possível conectar ao servidor LLM interno. Tente novamente mais tarde."
+            logger.error("Falha de comunicação ao conectar em %s.", self.config.llm_url)
+            raise CommunicationError(
+                "Falha de comunicação com o servidor LLM interno. Verifique a conectividade."
+            )
+        except requests.exceptions.RequestException as exc:
+            logger.error("Erro de transporte na comunicação com o LLM: %s", type(exc).__name__)
+            raise CommunicationError("Erro de comunicação ao tentar acessar o servidor LLM.")
+
+        self._handle_http_status(response)
+
+        try:
+            body = response.json()
+        except ValueError:
+            logger.error("Corpo HTTP retornado pelo servidor LLM não é JSON válido.")
+            raise InvalidResponseError(
+                "O servidor LLM retornou uma resposta em formato inesperado (não JSON)."
             )
 
-        except requests.exceptions.HTTPError as exc:
-            status_code = exc.response.status_code
-            logger.error(f"Erro HTTP {status_code} retornado pelo servidor LLM.")
-            raise LLMResponseError(
-                f"Falha ao contatar o servidor LLM interno (HTTP {status_code})."
+        logger.info("Resposta HTTP %s recebida do servidor LLM.", response.status_code)
+        return body
+
+    def _handle_http_status(self, response: requests.Response) -> None:
+        status = response.status_code
+
+        if status in (401, 403):
+            logger.error("Acesso negado pelo servidor LLM (HTTP %s).", status)
+            raise InvalidCredentialError(
+                "Credencial inválida ou sem permissão para acessar o servidor LLM."
             )
 
-        except json.JSONDecodeError:
-            logger.error("O LLM retornou conteúdo fora do formato JSON válido.")
-            raise LLMResponseError(
-                "O servidor LLM não retornou os dados em um formato JSON válido."
+        if status == 404:
+            logger.error("Modelo ou endpoint não encontrado no servidor LLM (HTTP 404).")
+            raise ModelUnavailableError(
+                f"O modelo LLM escolhido ('{self.config.llm_model}') não está disponível no servidor."
             )
 
-        except LLMResponseError:
-            raise
+        if status in (502, 503, 504):
+            logger.error("Servidor LLM temporariamente indisponível (HTTP %s).", status)
+            raise ModelUnavailableError(
+                f"O servidor LLM escolhido está temporariamente indisponível (HTTP {status})."
+            )
 
-        except Exception as exc:
-            logger.error(f"Erro inesperado na integração com o LLM: {exc}")
-            raise LLMResponseError("Falha inesperada na comunicação com o servidor LLM.")
-       
+        if status >= 400:
+            logger.error("Erro HTTP inesperado retornado pelo servidor LLM: %s.", status)
+            raise InvalidResponseError(
+                f"Falha ao processar solicitação no servidor LLM (HTTP {status})."
+            )
+
+    def check_health(self) -> dict:
+        """Consultar disponibilidade."""
+        url = f"{self.config.llm_url}/api/tags"
+        headers = {"Authorization": f"Bearer {self.config.llm_api_key}"}
+
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=5,
+                verify=self.config.verify_ssl,
+            )
+            if response.status_code in (401, 403):
+                return {"reachable": True, "authenticated": False, "status_code": response.status_code}
+
+            response.raise_for_status()
+            models = [m.get("name") for m in response.json().get("models", []) if isinstance(m, dict)]
+            return {
+                "reachable": True,
+                "authenticated": True,
+                "model_available": self.config.llm_model in models if models else None,
+                "status_code": response.status_code,
+            }
+        except requests.exceptions.RequestException:
+            logger.warning("Healthcheck do LLM falhou ao acessar %s.", url)
+            return {"reachable": False, "authenticated": False}
