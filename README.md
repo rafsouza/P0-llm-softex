@@ -310,9 +310,9 @@ Saída esperada: **`22 passed`** (`16` em `tests/test_client.py` + `6` em `tests
 
 **Para executar cada suíte separadamente:**
 
-# Configuração, preparação de requisição, cliente HTTP mockado e parser
+**Configuração, preparação de requisição, cliente HTTP mockado e parser**
 pytest tests/test_client.py -v
 
-# Rotas FastAPI (/events), validação de entrada vazia, retorno de dados e download opcional
+**Rotas FastAPI (/events), validação de entrada vazia, retorno de dados e download opcional**
 pytest tests/test_gateway.py -v
 
